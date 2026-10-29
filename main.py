@@ -296,9 +296,6 @@ async def main() -> None:
         vision_targets: list[tuple[int, object, str]] = []
         for message in reversed(messages):
             raw = (message.raw_text or "").strip()
-            shown = media.render_message(message)
-            if not shown:
-                continue
             if raw.startswith(ROBOT_PREFIX):
                 role = "Бот"
                 if message.id not in bot_message_ids:
@@ -316,16 +313,19 @@ async def main() -> None:
                         sender = None
                     labels[sender_id] = sender_label(sender)
                 role = labels[sender_id]
-            items.append((role, truncate(shown)))
+            parts = media.split_message(message, role)
+            if not parts:
+                continue
+            for entry_role, entry_text in parts:
+                items.append((entry_role, truncate(entry_text)))
             mime = media.vision_mime(message)
             if mime:
                 vision_targets.append((len(items) - 1, message, mime))
 
-        for index, message, mime in vision_targets[-2:]:
+        for index, message, mime in reversed(vision_targets[-2:]):
             desc = await describe_photo(message)
             if desc:
-                role = items[index][0]
-                items[index] = (role, truncate(media.render_message(message, desc)))
+                items.insert(index + 1, ("Система", truncate(f"{media.SYSTEM_DESC_PREFIX}: {desc}")))
 
         if items:
             recent = items[-RECENT_LIMIT:]
@@ -784,15 +784,13 @@ async def main() -> None:
 
         if not is_active_chat(event):
             return
-        shown = media.render_message(event.message)
-        if not shown:
-            return
 
         desc = await describe_photo(event.message)
-        if desc:
-            shown = media.render_message(event.message, desc)
-
-        append_recent("Я", shown)
+        parts = media.split_message(event.message, "Я", desc)
+        if not parts:
+            return
+        for entry_role, entry_text in parts:
+            append_recent(entry_role, entry_text)
         persist()
         pending_count += 1
 
@@ -808,19 +806,17 @@ async def main() -> None:
         if not is_active_chat(event):
             return
         text = (event.raw_text or "").strip()
-        shown = media.render_message(event.message)
-        if not shown:
-            return
-
         desc = await describe_photo(event.message)
-        if desc:
-            shown = media.render_message(event.message, desc)
 
         try:
             sender = await event.get_sender()
         except Exception:
             sender = None
-        append_recent(sender_label(sender), shown)
+        parts = media.split_message(event.message, sender_label(sender), desc)
+        if not parts:
+            return
+        for entry_role, entry_text in parts:
+            append_recent(entry_role, entry_text)
         persist()
         pending_count += 1
 

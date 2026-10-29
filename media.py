@@ -77,20 +77,34 @@ def stub_for_message(message) -> str | None:
     return None
 
 
-def render_message(message, description: str | None = None) -> str:
-    """Текст сообщения для контекста: заглушка + описание + подпись."""
+def render_message(message) -> str:
+    """Текст сообщения для контекста: заглушка медиа + подпись автора."""
     raw = (getattr(message, "raw_text", None) or "").strip()
     stub = stub_for_message(message)
-    if not stub and not raw and not description:
+    if not stub and not raw:
         return ""
     parts = []
     if stub:
         parts.append(stub)
-    if description:
-        parts.append(description.strip())
     if raw:
         parts.append(raw)
     return "\n".join(parts)
+
+
+SYSTEM_ROLE = "Система"
+SYSTEM_DESC_PREFIX = "[авто-описание]"
+
+
+def split_message(message, role: str, description: str | None = None) -> list:
+    """Разбивает сообщение на запись участника и (опционально) системную
+    запись с авто-описанием фото. Описание никогда не приписывается автору."""
+    entries = []
+    base = render_message(message)
+    if base:
+        entries.append((role, base))
+    if description and str(description).strip():
+        entries.append((SYSTEM_ROLE, f"{SYSTEM_DESC_PREFIX}: {str(description).strip()}"))
+    return entries
 
 
 def vision_mime(message) -> str | None:
