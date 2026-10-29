@@ -77,7 +77,7 @@ async def describe_image(cfg: Config, data: bytes, mime: str) -> str | None:
                 ],
             }
         ],
-        "max_tokens": 300,
+        "max_tokens": 1000,
         "temperature": 0.4,
     }
     headers = {"Authorization": f"Bearer {cfg.vision_api_key}"}
