@@ -44,13 +44,22 @@ def get_chat(chat_id: int) -> dict:
         ):
             clean_recent.append([item[0], item[1]])
 
+    norms = data.get("norms")
+    if not isinstance(norms, str):
+        norms = ""
+
     try:
         next_wake = int(data.get("next_wake_in", DEFAULT_WAKE))
     except (TypeError, ValueError):
         next_wake = DEFAULT_WAKE
     next_wake = max(WAKE_MIN, min(WAKE_MAX, next_wake))
 
-    return {"facts": facts, "recent": clean_recent, "next_wake_in": next_wake}
+    return {
+        "facts": facts,
+        "norms": norms,
+        "recent": clean_recent,
+        "next_wake_in": next_wake,
+    }
 
 
 def save_chat(
@@ -58,10 +67,12 @@ def save_chat(
     facts: str,
     recent: list[list[str]],
     next_wake: int,
+    norms: str = "",
 ) -> None:
     all_data = _load_all()
     all_data[str(chat_id)] = {
         "facts": facts,
+        "norms": norms,
         "recent": recent[-RECENT_LIMIT:],
         "next_wake_in": max(WAKE_MIN, min(WAKE_MAX, next_wake)),
     }

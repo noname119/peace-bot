@@ -109,6 +109,7 @@ async def main() -> None:
 
     active = state.load()
     facts = ""
+    norms = ""
     recent: list[tuple[str, str]] = []
     next_wake = INITIAL_WAKE
     pending_count = 0
@@ -123,9 +124,10 @@ async def main() -> None:
         return active is not None and event.chat_id == active["chat_id"]
 
     def load_chat(chat_id: int) -> None:
-        nonlocal facts, recent, next_wake, pending_count
+        nonlocal facts, norms, recent, next_wake, pending_count
         saved = memory.get_chat(chat_id)
         facts = saved["facts"]
+        norms = saved["norms"]
         recent = [tuple(item) for item in saved["recent"]]
         next_wake = saved["next_wake_in"]
         pending_count = 0
@@ -139,6 +141,7 @@ async def main() -> None:
             facts,
             [list(item) for item in recent],
             next_wake,
+            norms,
         )
 
     def append_recent(role: str, text: str) -> None:
@@ -230,12 +233,13 @@ async def main() -> None:
         await notify_owner(f"Бот остановлен. В чате «{title}» он больше не проснётся.")
 
     async def reset_memory(event) -> None:
-        nonlocal facts, recent, next_wake, pending_count
+        nonlocal facts, norms, recent, next_wake, pending_count
         if active is None:
             await notify_owner("Нет активного чата: память очищать нечего.")
             return
         title = active.get("title") or str(active["chat_id"])
         facts = ""
+        norms = ""
         recent = []
         next_wake = INITIAL_WAKE
         pending_count = 0
@@ -255,7 +259,7 @@ async def main() -> None:
             bot_message_ids.append(sent.id)
 
     async def run_wake(force: bool = False) -> None:
-        nonlocal pending_count, next_wake, facts, waking, llm_backoff_until
+        nonlocal pending_count, next_wake, facts, norms, waking, llm_backoff_until
         if waking or active is None:
             return
         if not force and pending_count < next_wake:
@@ -274,7 +278,7 @@ async def main() -> None:
                 force = False
 
                 analyzed = pending_count
-                decision = await brain.decide(cfg, facts, list(recent), analyzed)
+                decision = await brain.decide(cfg, facts, norms, list(recent), analyzed)
                 if decision is None:
                     llm_backoff_until = time.monotonic() + LLM_BACKOFF
                     log.warning("Пробуждение отложено на %s секунд", LLM_BACKOFF)
@@ -284,6 +288,8 @@ async def main() -> None:
                 next_wake = decision.next_wake
                 if decision.memory:
                     facts = decision.memory
+                if decision.norms:
+                    norms = decision.norms
                 persist()
 
                 log.info(
