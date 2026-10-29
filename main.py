@@ -144,6 +144,19 @@ def contains_bot_word(text: str) -> bool:
     return False
 
 
+async def typing_loop(client, chat_id: int, stop: "asyncio.Event") -> None:
+    """Показывает «печатает…», пока бот обдумывает ответ на обращение."""
+    while not stop.is_set():
+        try:
+            await client.send_chat_action(chat_id, "typing")
+        except Exception:
+            log.debug("Не удалось отправить typing", exc_info=True)
+        for _ in range(8):
+            if stop.is_set():
+                return
+            await asyncio.sleep(0.5)
+
+
 async def main() -> None:
     if sys.platform == "win32":
         try:
@@ -489,6 +502,8 @@ async def main() -> None:
 
         waking = True
         first = True
+        typing_task = None
+        typing_stop = None
         try:
             while True:
                 snapshot = active
@@ -504,6 +519,11 @@ async def main() -> None:
                 analyzed = pending_count
 
                 chat_id = snapshot["chat_id"]
+                if hint and typing_task is None:
+                    typing_stop = asyncio.Event()
+                    typing_task = asyncio.create_task(
+                        typing_loop(client, chat_id, typing_stop)
+                    )
                 last_ts = last_bot_at.get(chat_id)
                 last_minutes = (
                     max(0, int((time.time() - last_ts) / 60)) if last_ts else None
@@ -601,6 +621,13 @@ async def main() -> None:
                 if time.monotonic() < llm_backoff_until:
                     return
         finally:
+            if typing_stop is not None:
+                typing_stop.set()
+            if typing_task is not None:
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
             waking = False
 
     @client.on(events.NewMessage(outgoing=True))
