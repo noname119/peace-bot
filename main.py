@@ -14,8 +14,10 @@ from telethon import TelegramClient, events
 from telethon.tl.types import InputPeerChannel, InputPeerChat, InputPeerUser
 
 import brain
+import media
 import memory
 import state
+import vision
 from config import load_config
 
 log = logging.getLogger("userbot")
@@ -270,10 +272,11 @@ async def main() -> None:
         items: list[tuple[str, str]] = []
         labels: dict[int, str] = {}
         for message in reversed(messages):
-            text = (message.raw_text or "").strip()
-            if not text:
+            raw = (message.raw_text or "").strip()
+            shown = media.render_message(message)
+            if not shown:
                 continue
-            if text.startswith(ROBOT_PREFIX):
+            if raw.startswith(ROBOT_PREFIX):
                 role = "Бот"
                 if message.id not in bot_message_ids:
                     bot_message_ids.append(message.id)
@@ -290,7 +293,7 @@ async def main() -> None:
                         sender = None
                     labels[sender_id] = sender_label(sender)
                 role = labels[sender_id]
-            items.append((role, truncate(text)))
+            items.append((role, truncate(shown)))
 
         if items:
             recent = items[-RECENT_LIMIT:]
@@ -729,7 +732,11 @@ async def main() -> None:
         if not is_active_chat(event) or not text:
             return
 
-        append_recent("Я", text)
+        shown = media.render_message(event.message)
+        if not shown:
+            return
+
+        append_recent("Я", shown)
         persist()
         pending_count += 1
 
@@ -745,14 +752,28 @@ async def main() -> None:
         if not is_active_chat(event):
             return
         text = (event.raw_text or "").strip()
-        if not text:
+        shown = media.render_message(event.message)
+        if not shown:
             return
+
+        desc = None
+        mime = media.vision_mime(event.message)
+        if mime:
+            try:
+                data = await client.download_media(event.message, file=bytes)
+            except Exception:
+                data = None
+                log.debug("Не удалось скачать медиа", exc_info=True)
+            if data:
+                desc = await vision.describe_image(cfg, data, mime)
+            if desc:
+                shown = media.render_message(event.message, desc)
 
         try:
             sender = await event.get_sender()
         except Exception:
             sender = None
-        append_recent(sender_label(sender), text)
+        append_recent(sender_label(sender), shown)
         persist()
         pending_count += 1
 

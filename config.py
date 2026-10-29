@@ -51,6 +51,17 @@ class Config:
     chime_min_gap: int
     mandatory_reply: bool
     conflict_min_gap: int
+    vision_enabled: bool
+    vision_base_url: str
+    vision_api_key: str
+    vision_model: str
+
+
+def _fallback_env(primary: str, fallback: str, default: str = "") -> str:
+    value = os.getenv(primary, "").strip()
+    if value:
+        return value
+    return os.getenv(fallback, "").strip() or default
 
 
 def load_config() -> Config:
@@ -72,4 +83,10 @@ def load_config() -> Config:
         chime_min_gap=max(60, _env_int("CHIME_MIN_GAP", 900)),
         mandatory_reply=_env_bool("MANDATORY_REPLY", True),
         conflict_min_gap=max(30, _env_int("CONFLICT_MIN_GAP", 90)),
+        vision_enabled=_env_bool("VISION_ENABLED", True),
+        vision_base_url=_fallback_env(
+            "VISION_BASE_URL", "OPENAI_BASE_URL", "https://api.deepseek.com/v1"
+        ).rstrip("/"),
+        vision_api_key=_fallback_env("VISION_API_KEY", "OPENAI_API_KEY"),
+        vision_model=_fallback_env("VISION_MODEL", "LLM_MODEL", "deepseek-flash"),
     )
