@@ -6,6 +6,7 @@ import sys
 import time
 import warnings
 from collections import deque
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from telethon import TelegramClient, events
@@ -25,7 +26,12 @@ BOT_ID_LIMIT = 10
 INITIAL_WAKE = 1
 LLM_BACKOFF = 60
 CHIME_MIN_GAP = 900
+BOT_MIN_GAP = 30
+CONFLICT_MIN_GAP = 600
+RATE_WINDOW = 600
+RATE_MAX = 6
 RESET_FLAG = Path(__file__).with_name("reset.flag")
+LOG_PATH = Path(__file__).with_name("bot.log")
 
 BOT_WORD_STRIP = ".,!?;:()[]{}\"'«»…—–-"
 
@@ -100,9 +106,16 @@ async def main() -> None:
         except Exception:
             pass
 
+    file_handler = RotatingFileHandler(
+        LOG_PATH,
+        maxBytes=2_000_000,
+        backupCount=3,
+        encoding="utf-8",
+    )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(), file_handler],
     )
     cfg = load_config()
     if not cfg.api_id or not cfg.api_hash:
@@ -126,6 +139,8 @@ async def main() -> None:
     pending_count = 0
     bot_message_ids: deque[int] = deque(maxlen=BOT_ID_LIMIT)
     last_bot_at: dict[int, float] = {}
+    last_conflict_at: dict[int, float] = {}
+    sent_times: dict[int, deque[float]] = {}
     waking = False
     llm_backoff_until = 0.0
 
@@ -134,6 +149,20 @@ async def main() -> None:
 
     def is_active_chat(event) -> bool:
         return active is not None and event.chat_id == active["chat_id"]
+
+    def can_send(chat_id: int, reason: str, now: float) -> tuple[bool, str]:
+        if now - last_bot_at.get(chat_id, 0) < BOT_MIN_GAP:
+            return False, "слишком часто"
+        if reason == "conflict" and now - last_conflict_at.get(chat_id, 0) < CONFLICT_MIN_GAP:
+            return False, "недавно уже вмешивались в конфликт"
+        if reason == "chime" and now - last_bot_at.get(chat_id, 0) < CHIME_MIN_GAP:
+            return False, "недавно писали"
+        times = sent_times.setdefault(chat_id, deque())
+        while times and now - times[0] > RATE_WINDOW:
+            times.popleft()
+        if len(times) >= RATE_MAX:
+            return False, "лимит 6 сообщений за 10 минут"
+        return True, ""
 
     def load_chat(chat_id: int) -> None:
         nonlocal facts, norms, recent, next_wake, pending_count
@@ -263,7 +292,7 @@ async def main() -> None:
             f"Память и контекст в чате «{title}» очищены. Начинаю с чистого листа."
         )
 
-    async def send_bot_message(chat_id: int, text: str) -> None:
+    async def send_bot_message(chat_id: int, text: str, reason: str = "") -> None:
         snapshot = active
         if snapshot is None:
             return
@@ -271,7 +300,11 @@ async def main() -> None:
         sent = await client.send_message(peer, ROBOT_PREFIX + text)
         if sent and sent.id not in bot_message_ids:
             bot_message_ids.append(sent.id)
-        last_bot_at[chat_id] = time.time()
+        now = time.time()
+        last_bot_at[chat_id] = now
+        sent_times.setdefault(chat_id, deque()).append(now)
+        if reason == "conflict":
+            last_conflict_at[chat_id] = now
 
     async def run_wake(force: bool = False, addressed: bool = False) -> None:
         nonlocal pending_count, next_wake, facts, norms, waking, llm_backoff_until
@@ -334,20 +367,21 @@ async def main() -> None:
                 )
 
                 should_send = decision.speak
-                if should_send and decision.reason == "chime":
-                    gap = time.time() - last_bot_at.get(chat_id, 0)
-                    if gap < CHIME_MIN_GAP:
+                if should_send:
+                    allowed, why = can_send(chat_id, decision.reason, time.time())
+                    if not allowed:
                         should_send = False
-                        log.info(
-                            "Чим пропущен: последнее сообщение бота %.0f с назад",
-                            gap,
-                        )
+                        log.info("Сообщение пропущено: %s", why)
 
                 if should_send:
                     if active is not snapshot:
                         return
                     try:
-                        await send_bot_message(snapshot["chat_id"], decision.message)
+                        await send_bot_message(
+                            snapshot["chat_id"],
+                            decision.message,
+                            decision.reason,
+                        )
                     except Exception:
                         log.exception("Не удалось отправить сообщение")
 

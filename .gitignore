@@ -2,6 +2,7 @@
 state.json
 memory.json
 reset.flag
+bot.log*
 *.session
 *.session-journal
 __pycache__/
