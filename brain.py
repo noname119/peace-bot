@@ -121,6 +121,128 @@ def parse_decision(content: str) -> Decision | None:
     )
 
 
+@dataclass
+class Order:
+    action: str
+    text: str = ""
+    minutes: int = 0
+    wake_in: int = 0
+    target: str = "facts"
+
+
+ORDER_ACTIONS = {"say", "remember", "set_wake", "silence", "status", "none"}
+
+
+def parse_order(content: str) -> Order:
+    try:
+        data = json.loads(content)
+    except (TypeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    action = data.get("action")
+    action = action.strip().lower() if isinstance(action, str) else ""
+    if action not in ORDER_ACTIONS:
+        action = "none"
+
+    text = data.get("text")
+    text = text.strip() if isinstance(text, str) else ""
+
+    try:
+        minutes = int(data.get("minutes", 0))
+    except (TypeError, ValueError):
+        minutes = 0
+    minutes = max(0, min(180, minutes))
+
+    try:
+        wake_in = int(data.get("wake_in", 0))
+    except (TypeError, ValueError):
+        wake_in = 0
+    wake_in = max(0, min(15, wake_in))
+
+    target = data.get("target")
+    target = target.strip().lower() if isinstance(target, str) else "facts"
+    if target not in {"facts", "norms"}:
+        target = "facts"
+
+    return Order(action=action, text=text, minutes=minutes, wake_in=wake_in, target=target)
+
+
+async def execute_order(
+    cfg: Config,
+    facts: str,
+    norms: str,
+    recent: list[tuple[str, str]],
+    order_text: str,
+) -> Order | None:
+    """Разбирает служебный приказ владельца.
+
+    Возвращает Order или None при ошибке транспорта.
+    """
+    if not cfg.llm_api_key:
+        log.warning("LLM не настроен, приказ не разобран")
+        return None
+    try:
+        import httpx
+    except ImportError:
+        log.warning("httpx не установлен")
+        return None
+
+    prompt = (
+        f"Долговременная память:\n{facts or '(пусто)'}\n\n"
+        f"Нормы общения в чате:\n{norms or '(не заданы)'}\n\n"
+        f"Последние сообщения чата:\n{_format_recent(recent)}\n\n"
+        f"Служебный приказ владельца:\n{order_text}\n\n"
+        "Разбери приказ в одно действие. Варианты action: "
+        "say — сказать что-то в чат (приказы вида «скажи ...», «напиши ...», "
+        "«скажи что-нибудь»); text — готовый текст сообщения от лица бота; "
+        "remember — «запомни ...»: text — факт одной строкой, target — facts "
+        "(факты о людях, договорённости) или norms (правила общения в чате); "
+        "set_wake — «проверяй чаще/реже», «просыпайся каждые N»: wake_in 1..15; "
+        "silence — «молчи N минут», «помолчи», «тихо»: minutes (по умолчанию 30, "
+        "максимум 180); «говори», «хватит молчать» — minutes 0; "
+        "status — «статус», «отчёт», «что ты помнишь»: остальные поля пустые; "
+        "none — приказ непонятен. "
+        'Верни строго JSON без пояснений: {"action": "say", "text": "...", '
+        '"minutes": 0, "wake_in": 0, "target": "facts"}'
+    )
+    payload = {
+        "model": cfg.llm_model,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 800,
+        "response_format": {"type": "json_object"},
+    }
+    if cfg.llm_thinking:
+        payload["thinking"] = {"type": "enabled"}
+        payload["reasoning_effort"] = cfg.llm_reasoning_effort
+    else:
+        payload["temperature"] = 0.7
+    headers = {"Authorization": f"Bearer {cfg.llm_api_key}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=cfg.llm_timeout) as http:
+            response = await http.post(
+                f"{cfg.llm_base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+        content = data["choices"][0]["message"]["content"]
+    except Exception:
+        log.warning("LLM недоступен для разбора приказа", exc_info=True)
+        return None
+
+    order = parse_order(str(content))
+    if order.action == "none":
+        log.warning("Приказ не распознан: %s", str(content)[:300])
+    return order
+
+
 async def decide(
     cfg: Config,
     facts: str,

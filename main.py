@@ -6,6 +6,7 @@ import sys
 import time
 import warnings
 from collections import deque
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -89,6 +90,18 @@ def parse_command(text: str) -> str | None:
     return None
 
 
+def parse_service_command(text: str) -> str | None:
+    """Возвращает текст после '!служебно' или None, если это не такая команда."""
+    stripped = (text or "").strip()
+    low = stripped.lower()
+    prefix = "!служебно"
+    if low == prefix:
+        return ""
+    if low.startswith(prefix) and len(low) > len(prefix) and not low[len(prefix)].isalnum():
+        return stripped[len(prefix):].lstrip(" \t\n:,-—–").strip()
+    return None
+
+
 def contains_bot_word(text: str) -> bool:
     for token in (text or "").lower().split():
         cleaned = token.strip(BOT_WORD_STRIP)
@@ -142,6 +155,7 @@ async def main() -> None:
     sent_times: dict[int, deque[float]] = {}
     waking = False
     llm_backoff_until = 0.0
+    silence_until = 0.0
 
     log.info("Аккаунт: %s (id=%s)", me.username or me.first_name or own_id, own_id)
     log.info("LLM: %s (%s)", cfg.llm_model, cfg.llm_base_url)
@@ -243,7 +257,7 @@ async def main() -> None:
             log.debug("Не удалось удалить команду", exc_info=True)
 
     async def activate(event) -> None:
-        nonlocal active
+        nonlocal active, silence_until
         if active is not None and active["chat_id"] == event.chat_id:
             await notify_owner("Бот уже активен в этом чате.")
             return
@@ -257,6 +271,7 @@ async def main() -> None:
         }
         state.save(active["chat_id"], active["access_hash"], title)
         load_chat(active["chat_id"])
+        silence_until = 0.0
         await seed_context()
         log.info("Бот активирован в чате %s (%s)", title, event.chat_id)
         await notify_owner(
@@ -264,13 +279,14 @@ async def main() -> None:
         )
 
     async def deactivate(event) -> None:
-        nonlocal active
+        nonlocal active, silence_until
         if active is None:
             await notify_owner("Бот уже остановлен.")
             return
         title = active.get("title") or str(active["chat_id"])
         active = None
         state.clear()
+        silence_until = 0.0
         log.info("Бот остановлен")
         await notify_owner(f"Бот остановлен. В чате «{title}» он больше не проснётся.")
 
@@ -290,6 +306,104 @@ async def main() -> None:
         await notify_owner(
             f"Память и контекст в чате «{title}» очищены. Начинаю с чистого листа."
         )
+
+    async def execute_service_order(event, order_text: str) -> None:
+        nonlocal facts, norms, next_wake, silence_until
+        if active is None:
+            await notify_owner(
+                "Нет активного чата: некуда выполнять приказ. Сначала !activate."
+            )
+            return
+        chat_id = active["chat_id"]
+        title = active.get("title") or str(chat_id)
+        if not order_text:
+            await notify_owner("Пустой приказ. Пример: !служебно скажи, что я скоро буду.")
+            return
+
+        try:
+            order = await brain.execute_order(cfg, facts, norms, list(recent), order_text)
+        except Exception:
+            log.exception("Не удалось разобрать приказ")
+            await notify_owner("Не удалось разобрать приказ: ошибка LLM.")
+            return
+        if order is None:
+            await notify_owner("Не удалось разобрать приказ: LLM недоступен.")
+            return
+        log.info(
+            "Приказ: action=%s target=%s minutes=%s wake_in=%s",
+            order.action,
+            order.target,
+            order.minutes,
+            order.wake_in,
+        )
+
+        if order.action == "say":
+            if not order.text:
+                await notify_owner("Не понял, что именно сказать.")
+                return
+            allowed, why = can_send(chat_id, "", time.time(), mandatory=True)
+            if not allowed:
+                await notify_owner(f"Не могу отправить сейчас: {why}.")
+                return
+            try:
+                await send_bot_message(chat_id, order.text, "")
+            except Exception:
+                log.exception("Не удалось выполнить приказ say")
+                await notify_owner("Не удалось отправить сообщение.")
+                return
+            await notify_owner(f"Сказал в чате «{title}».")
+        elif order.action == "remember":
+            if not order.text:
+                await notify_owner("Не понял, что именно запомнить.")
+                return
+            entry = order.text.strip()
+            if order.target == "norms":
+                norms = (norms + "\n" + entry).strip() if norms else entry
+                where = "нормы"
+            else:
+                facts = (facts + "\n" + entry).strip() if facts else entry
+                where = "память"
+            persist()
+            await notify_owner(f"Записал в {where}: {order.text}")
+        elif order.action == "set_wake":
+            if not 1 <= order.wake_in <= 15:
+                await notify_owner("Не понял интервал: укажите число от 1 до 15.")
+                return
+            next_wake = order.wake_in
+            persist()
+            await notify_owner(f"Интервал пробуждений: {next_wake} сообщений.")
+        elif order.action == "silence":
+            if order.minutes <= 0:
+                silence_until = 0.0
+                await notify_owner("Режим молчания выключен.")
+            else:
+                silence_until = time.monotonic() + order.minutes * 60
+                end = datetime.fromtimestamp(time.time() + order.minutes * 60).strftime("%H:%M")
+                await notify_owner(f"Молчу {order.minutes} мин (до {end}).")
+        elif order.action == "status":
+            last_ts = last_bot_at.get(chat_id)
+            if last_ts:
+                last_text = f"{max(0, int((time.time() - last_ts) / 60))} мин. назад"
+            else:
+                last_text = "ещё не писал"
+            if silence_until > time.monotonic():
+                left = int((silence_until - time.monotonic()) / 60)
+                silence_text = f"до конца осталось ~{left} мин"
+            else:
+                silence_text = "выкл"
+            fact_lines = [line for line in facts.splitlines() if line.strip()]
+            lines = [
+                f"Активный чат: «{title}» ({chat_id})",
+                f"Пробуждение через: {next_wake} сообщений (накоплено: {pending_count})",
+                f"Последнее сообщение бота: {last_text}",
+                f"Молчание: {silence_text}",
+                f"Память: фактов: {len(fact_lines)}, нормы: {'есть' if norms.strip() else 'нет'}, "
+                f"сообщений в контексте: {len(recent)}",
+                f"LLM: {cfg.llm_model} (thinking {'вкл' if cfg.llm_thinking else 'выкл'})",
+            ]
+            await notify_owner("\n".join(lines))
+        else:
+            await notify_owner("Не понял приказ.")
 
     async def send_bot_message(chat_id: int, text: str, reason: str = "") -> None:
         snapshot = active
@@ -397,6 +511,9 @@ async def main() -> None:
                 if should_send and decision.reason == "chime" and not cfg.chime_enabled:
                     should_send = False
                     log.info("Сообщение пропущено: вступления отключены (CHIME_ENABLED=0)")
+                if should_send and time.monotonic() < silence_until:
+                    should_send = False
+                    log.info("Сообщение пропущено: режим молчания (служебный приказ)")
                 if should_send:
                     allowed, why = can_send(
                         chat_id,
@@ -456,6 +573,13 @@ async def main() -> None:
             if event.chat_id != own_id:
                 await delete_command(event)
             await reset_memory(event)
+            return
+
+        service = parse_service_command(text)
+        if service is not None:
+            if event.chat_id != own_id:
+                await delete_command(event)
+            await execute_service_order(event, service)
             return
 
         if not is_active_chat(event) or not text:
