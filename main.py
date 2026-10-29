@@ -209,6 +209,8 @@ async def main() -> None:
     last_conflict_at: dict[int, float] = {}
     sent_times: dict[int, deque[float]] = {}
     waking = False
+    wake_queued = False
+    wake_queued_addressed = False
     llm_backoff_until = 0.0
     silence_until = 0.0
 
@@ -258,6 +260,26 @@ async def main() -> None:
         if len(recent) > RECENT_LIMIT:
             del recent[:-RECENT_LIMIT]
 
+    async def describe_photo(message) -> str | None:
+        """Скачивает и описывает фото/статичный стикер. None — не вышло."""
+        mime = media.vision_mime(message)
+        if not mime:
+            return None
+        try:
+            data = await client.download_media(message, file=bytes)
+        except Exception:
+            data = None
+            log.debug("Не удалось скачать медиа", exc_info=True)
+        if not data:
+            log.info("Фото: не удалось скачать")
+            return None
+        desc = await vision.describe_image(cfg, data, mime)
+        if desc:
+            log.info("Фото описано: %s", desc[:150])
+            return desc
+        log.info("Фото: vision не вернул описание")
+        return None
+
     async def seed_context() -> None:
         nonlocal recent
         if active is None:
@@ -271,6 +293,7 @@ async def main() -> None:
 
         items: list[tuple[str, str]] = []
         labels: dict[int, str] = {}
+        vision_targets: list[tuple[int, object, str]] = []
         for message in reversed(messages):
             raw = (message.raw_text or "").strip()
             shown = media.render_message(message)
@@ -294,6 +317,15 @@ async def main() -> None:
                     labels[sender_id] = sender_label(sender)
                 role = labels[sender_id]
             items.append((role, truncate(shown)))
+            mime = media.vision_mime(message)
+            if mime:
+                vision_targets.append((len(items) - 1, message, mime))
+
+        for index, message, mime in vision_targets[-2:]:
+            desc = await describe_photo(message)
+            if desc:
+                role = items[index][0]
+                items[index] = (role, truncate(media.render_message(message, desc)))
 
         if items:
             recent = items[-RECENT_LIMIT:]
@@ -313,7 +345,7 @@ async def main() -> None:
             log.debug("Не удалось удалить команду", exc_info=True)
 
     async def activate(event) -> None:
-        nonlocal active, silence_until
+        nonlocal active, silence_until, wake_queued, wake_queued_addressed
         if active is not None and active["chat_id"] == event.chat_id:
             await notify_owner("Бот уже активен в этом чате.")
             return
@@ -328,6 +360,8 @@ async def main() -> None:
         state.save(active["chat_id"], active["access_hash"], title)
         load_chat(active["chat_id"])
         silence_until = 0.0
+        wake_queued = False
+        wake_queued_addressed = False
         await seed_context()
         log.info("Бот активирован в чате %s (%s)", title, event.chat_id)
         await notify_owner(
@@ -335,7 +369,7 @@ async def main() -> None:
         )
 
     async def deactivate(event) -> None:
-        nonlocal active, silence_until
+        nonlocal active, silence_until, wake_queued, wake_queued_addressed
         if active is None:
             await notify_owner("Бот уже остановлен.")
             return
@@ -343,11 +377,14 @@ async def main() -> None:
         active = None
         state.clear()
         silence_until = 0.0
+        wake_queued = False
+        wake_queued_addressed = False
         log.info("Бот остановлен")
         await notify_owner(f"Бот остановлен. В чате «{title}» он больше не проснётся.")
 
     async def reset_memory(event) -> None:
         nonlocal facts, norms, recent, next_wake, pending_count
+        nonlocal wake_queued, wake_queued_addressed
         if active is None:
             await notify_owner("Нет активного чата: память очищать нечего.")
             return
@@ -357,6 +394,8 @@ async def main() -> None:
         recent = []
         next_wake = INITIAL_WAKE
         pending_count = 0
+        wake_queued = False
+        wake_queued_addressed = False
         persist()
         log.info("Память и контекст очищены в чате %s", title)
         await notify_owner(
@@ -502,7 +541,14 @@ async def main() -> None:
 
     async def run_wake(force: bool = False, addressed: bool = False) -> None:
         nonlocal pending_count, next_wake, facts, norms, waking, llm_backoff_until
-        if waking or active is None:
+        nonlocal wake_queued, wake_queued_addressed
+        if active is None:
+            return
+        if waking:
+            if force:
+                wake_queued = True
+                wake_queued_addressed = wake_queued_addressed or addressed
+                log.info("Пробуждение поставлено в очередь (бот занят)")
             return
         if not force and pending_count < next_wake:
             return
@@ -527,6 +573,13 @@ async def main() -> None:
 
         try:
             while True:
+                if wake_queued:
+                    wake_queued = False
+                    force = True
+                    addressed = wake_queued_addressed
+                    wake_queued_addressed = False
+                    first = True
+                    log.info("Пробуждение из очереди")
                 snapshot = active
                 if snapshot is None or pending_count <= 0:
                     return
@@ -729,12 +782,15 @@ async def main() -> None:
             await execute_service_order(event, service)
             return
 
-        if not is_active_chat(event) or not text:
+        if not is_active_chat(event):
             return
-
         shown = media.render_message(event.message)
         if not shown:
             return
+
+        desc = await describe_photo(event.message)
+        if desc:
+            shown = media.render_message(event.message, desc)
 
         append_recent("Я", shown)
         persist()
@@ -756,18 +812,9 @@ async def main() -> None:
         if not shown:
             return
 
-        desc = None
-        mime = media.vision_mime(event.message)
-        if mime:
-            try:
-                data = await client.download_media(event.message, file=bytes)
-            except Exception:
-                data = None
-                log.debug("Не удалось скачать медиа", exc_info=True)
-            if data:
-                desc = await vision.describe_image(cfg, data, mime)
-            if desc:
-                shown = media.render_message(event.message, desc)
+        desc = await describe_photo(event.message)
+        if desc:
+            shown = media.render_message(event.message, desc)
 
         try:
             sender = await event.get_sender()
