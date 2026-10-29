@@ -3,6 +3,7 @@ state.json
 memory.json
 reset.flag
 bot.log*
+.kilo/
 *.session
 *.session-journal
 __pycache__/
