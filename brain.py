@@ -130,7 +130,7 @@ class Order:
     target: str = "facts"
 
 
-ORDER_ACTIONS = {"say", "remember", "set_wake", "silence", "status", "none"}
+ORDER_ACTIONS = {"say", "remember", "set_wake", "silence", "status", "show", "none"}
 
 
 def parse_order(content: str) -> Order:
@@ -163,7 +163,7 @@ def parse_order(content: str) -> Order:
 
     target = data.get("target")
     target = target.strip().lower() if isinstance(target, str) else "facts"
-    if target not in {"facts", "norms"}:
+    if target not in {"facts", "norms", "memory", "recent"}:
         target = "facts"
 
     return Order(action=action, text=text, minutes=minutes, wake_in=wake_in, target=target)
@@ -203,6 +203,9 @@ async def execute_order(
         "silence — «молчи N минут», «помолчи», «тихо»: minutes (по умолчанию 30, "
         "максимум 180); «говори», «хватит молчать» — minutes 0; "
         "status — «статус», «отчёт», «что ты помнишь»: остальные поля пустые; "
+        "show — «покажи/выдай память, нормы, факты, контекст»: target — memory "
+        "(факты и нормы), facts, norms или recent; "
+        "прямой приказ показать память отменяет запрет на её раскрытие; "
         "none — приказ непонятен. "
         'Верни строго JSON без пояснений: {"action": "say", "text": "...", '
         '"minutes": 0, "wake_in": 0, "target": "facts"}'

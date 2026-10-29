@@ -102,6 +102,40 @@ def parse_service_command(text: str) -> str | None:
     return None
 
 
+_SHOW_VERBS = (
+    "покажи", "показать", "показывай", "выдай", "выдать", "выдавай",
+    "выведи", "вывести", "выводи", "прочитай", "прочитать",
+    "расскажи", "рассказать", "напомни", "напомнить",
+    "выгрузи", "выгрузить", "скинь", "скинуть",
+    "продублируй", "продублировать",
+)
+
+_MEMORY_NOUNS = {
+    "память": "memory", "памяти": "memory", "памятью": "memory",
+    "нормы": "norms", "норм": "norms", "нормах": "norms", "норму": "norms",
+    "правила": "norms", "правилах": "norms", "правило": "norms",
+    "факты": "facts", "фактах": "facts", "факт": "facts", "фактов": "facts",
+    "контекст": "recent", "контексте": "recent",
+    "переписку": "recent", "переписки": "recent", "переписке": "recent",
+    "историю": "recent", "истории": "recent",
+    "сообщения": "recent", "сообщений": "recent",
+    "помнишь": "memory", "запомнил": "memory",
+}
+
+
+def detect_show_order(text: str) -> str | None:
+    """Определяет приказ показать память. Возвращает target или None."""
+    low = " " + (text or "").lower() + " "
+    if "что ты помнишь" in low or "что помнишь" in low:
+        return "memory"
+    if not any(verb in low for verb in _SHOW_VERBS):
+        return None
+    for noun, target in _MEMORY_NOUNS.items():
+        if noun in low:
+            return target
+    return None
+
+
 def contains_bot_word(text: str) -> bool:
     for token in (text or "").lower().split():
         cleaned = token.strip(BOT_WORD_STRIP)
@@ -320,22 +354,28 @@ async def main() -> None:
             await notify_owner("Пустой приказ. Пример: !служебно скажи, что я скоро буду.")
             return
 
-        try:
-            order = await brain.execute_order(cfg, facts, norms, list(recent), order_text)
-        except Exception:
-            log.exception("Не удалось разобрать приказ")
-            await notify_owner("Не удалось разобрать приказ: ошибка LLM.")
-            return
-        if order is None:
-            await notify_owner("Не удалось разобрать приказ: LLM недоступен.")
-            return
-        log.info(
-            "Приказ: action=%s target=%s minutes=%s wake_in=%s",
-            order.action,
-            order.target,
-            order.minutes,
-            order.wake_in,
-        )
+        show_target = detect_show_order(order_text)
+        if show_target is not None:
+            order = brain.Order(action="show", target=show_target)
+            log.info("Приказ %r: прямое распознавание, target=%s", order_text[:150], show_target)
+        else:
+            try:
+                order = await brain.execute_order(cfg, facts, norms, list(recent), order_text)
+            except Exception:
+                log.exception("Не удалось разобрать приказ")
+                await notify_owner("Не удалось разобрать приказ: ошибка LLM.")
+                return
+            if order is None:
+                await notify_owner("Не удалось разобрать приказ: LLM недоступен.")
+                return
+            log.info(
+                "Приказ %r: action=%s target=%s minutes=%s wake_in=%s",
+                order_text[:150],
+                order.action,
+                order.target,
+                order.minutes,
+                order.wake_in,
+            )
 
         if order.action == "say":
             if not order.text:
@@ -402,6 +442,25 @@ async def main() -> None:
                 f"LLM: {cfg.llm_model} (thinking {'вкл' if cfg.llm_thinking else 'выкл'})",
             ]
             await notify_owner("\n".join(lines))
+        elif order.action == "show":
+            if order.target == "facts":
+                body = facts.strip() or "(память пуста)"
+                header = "Факты из памяти:"
+            elif order.target == "norms":
+                body = norms.strip() or "(нормы не заданы)"
+                header = "Нормы чата:"
+            elif order.target == "recent":
+                convo = [f"{role}: {text}" for role, text in recent[-15:]]
+                body = "\n".join(convo) or "(контекст пуст)"
+                header = "Последние сообщения:"
+            else:
+                parts = [
+                    "Факты:\n" + (facts.strip() or "(пусто)"),
+                    "Нормы:\n" + (norms.strip() or "(не заданы)"),
+                ]
+                body = "\n\n".join(parts)
+                header = "Память бота:"
+            await notify_owner(f"{header}\n{body}")
         else:
             await notify_owner("Не понял приказ.")
 
