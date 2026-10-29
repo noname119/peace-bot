@@ -1,0 +1,8 @@
+.env
+state.json
+memory.json
+reset.flag
+*.session
+*.session-journal
+__pycache__/
+*.pyc
