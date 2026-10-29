@@ -46,6 +46,9 @@ class Config:
     llm_timeout: float
     llm_thinking: bool
     llm_reasoning_effort: str
+    reply_enabled: bool
+    chime_enabled: bool
+    chime_min_gap: int
 
 
 def load_config() -> Config:
@@ -62,4 +65,7 @@ def load_config() -> Config:
         llm_timeout=max(5.0, _env_float("LLM_TIMEOUT", 60.0)),
         llm_thinking=_env_bool("LLM_THINKING", True),
         llm_reasoning_effort=effort,
+        reply_enabled=_env_bool("REPLY_ENABLED", True),
+        chime_enabled=_env_bool("CHIME_ENABLED", True),
+        chime_min_gap=max(60, _env_int("CHIME_MIN_GAP", 900)),
     )

@@ -25,7 +25,6 @@ RECENT_LIMIT = 100
 BOT_ID_LIMIT = 10
 INITIAL_WAKE = 1
 LLM_BACKOFF = 60
-CHIME_MIN_GAP = 900
 BOT_MIN_GAP = 30
 CONFLICT_MIN_GAP = 600
 RATE_WINDOW = 600
@@ -155,7 +154,7 @@ async def main() -> None:
             return False, "слишком часто"
         if reason == "conflict" and now - last_conflict_at.get(chat_id, 0) < CONFLICT_MIN_GAP:
             return False, "недавно уже вмешивались в конфликт"
-        if reason == "chime" and now - last_bot_at.get(chat_id, 0) < CHIME_MIN_GAP:
+        if reason == "chime" and now - last_bot_at.get(chat_id, 0) < cfg.chime_min_gap:
             return False, "недавно писали"
         times = sent_times.setdefault(chat_id, deque())
         while times and now - times[0] > RATE_WINDOW:
@@ -344,6 +343,8 @@ async def main() -> None:
                     analyzed,
                     last_minutes,
                     hint,
+                    cfg.reply_enabled,
+                    cfg.chime_enabled,
                 )
                 if decision is None:
                     llm_backoff_until = time.monotonic() + LLM_BACKOFF
@@ -367,6 +368,12 @@ async def main() -> None:
                 )
 
                 should_send = decision.speak
+                if should_send and decision.reason == "answer" and not cfg.reply_enabled:
+                    should_send = False
+                    log.info("Сообщение пропущено: ответы отключены (REPLY_ENABLED=0)")
+                if should_send and decision.reason == "chime" and not cfg.chime_enabled:
+                    should_send = False
+                    log.info("Сообщение пропущено: вступления отключены (CHIME_ENABLED=0)")
                 if should_send:
                     allowed, why = can_send(chat_id, decision.reason, time.time())
                     if not allowed:
