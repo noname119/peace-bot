@@ -21,6 +21,7 @@ from config import load_config
 log = logging.getLogger("userbot")
 
 ROBOT_PREFIX = "🤖 "
+PLACEHOLDER_TEXT = "думаю…"
 TEXT_LIMIT = 400
 RECENT_LIMIT = 100
 BOT_ID_LIMIT = 10
@@ -144,17 +145,22 @@ def contains_bot_word(text: str) -> bool:
     return False
 
 
-async def typing_loop(client, chat_id: int, stop: "asyncio.Event") -> None:
-    """Показывает «печатает…», пока бот обдумывает ответ на обращение."""
-    while not stop.is_set():
-        try:
-            await client.send_chat_action(chat_id, "typing")
-        except Exception:
-            log.debug("Не удалось отправить typing", exc_info=True)
-        for _ in range(8):
-            if stop.is_set():
-                return
-            await asyncio.sleep(0.5)
+def replace_recent_placeholder(recent: list, old_text: str, new_text: str) -> bool:
+    for i in range(len(recent) - 1, -1, -1):
+        role, text = recent[i]
+        if role == "Бот" and text == old_text:
+            recent[i] = ("Бот", new_text)
+            return True
+    return False
+
+
+def remove_recent_placeholder(recent: list, old_text: str) -> bool:
+    for i in range(len(recent) - 1, -1, -1):
+        role, text = recent[i]
+        if role == "Бот" and text == old_text:
+            del recent[i]
+            return True
+    return False
 
 
 async def main() -> None:
@@ -502,8 +508,20 @@ async def main() -> None:
 
         waking = True
         first = True
-        typing_task = None
-        typing_stop = None
+        placeholder = None
+
+        async def drop_placeholder() -> None:
+            nonlocal placeholder
+            if placeholder is None:
+                return
+            msg, placeholder = placeholder, None
+            try:
+                await client.delete_messages(chat_id, msg.id)
+            except Exception:
+                log.debug("Не удалось удалить заглушку", exc_info=True)
+            if remove_recent_placeholder(recent, PLACEHOLDER_TEXT):
+                persist()
+
         try:
             while True:
                 snapshot = active
@@ -519,11 +537,25 @@ async def main() -> None:
                 analyzed = pending_count
 
                 chat_id = snapshot["chat_id"]
-                if hint and typing_task is None:
-                    typing_stop = asyncio.Event()
-                    typing_task = asyncio.create_task(
-                        typing_loop(client, chat_id, typing_stop)
-                    )
+                if hint and placeholder is None and time.monotonic() >= silence_until:
+                    now = time.time()
+                    rate_times = sent_times.setdefault(chat_id, deque())
+                    while rate_times and now - rate_times[0] > RATE_WINDOW:
+                        rate_times.popleft()
+                    if len(rate_times) < RATE_MAX:
+                        try:
+                            placeholder = await client.send_message(
+                                build_peer(snapshot) or chat_id,
+                                ROBOT_PREFIX + PLACEHOLDER_TEXT,
+                            )
+                        except Exception:
+                            log.warning("Не удалось отправить заглушку", exc_info=True)
+                            placeholder = None
+                    if placeholder is not None:
+                        if placeholder.id not in bot_message_ids:
+                            bot_message_ids.append(placeholder.id)
+                        last_bot_at[chat_id] = time.time()
+                        sent_times.setdefault(chat_id, deque()).append(time.time())
                 last_ts = last_bot_at.get(chat_id)
                 last_minutes = (
                     max(0, int((time.time() - last_ts) / 60)) if last_ts else None
@@ -544,6 +576,7 @@ async def main() -> None:
                 if decision is None:
                     llm_backoff_until = time.monotonic() + LLM_BACKOFF
                     log.warning("Пробуждение отложено на %s секунд", LLM_BACKOFF)
+                    await drop_placeholder()
                     return
 
                 if must_answer and (not decision.speak or not decision.message):
@@ -551,6 +584,7 @@ async def main() -> None:
                     if forced is None:
                         llm_backoff_until = time.monotonic() + LLM_BACKOFF
                         log.warning("Пробуждение отложено на %s секунд", LLM_BACKOFF)
+                        await drop_placeholder()
                         return
                     decision = brain.Decision(
                         True,
@@ -598,7 +632,9 @@ async def main() -> None:
                         chat_id,
                         decision.reason,
                         time.time(),
-                        mandatory=(must_answer and decision.reason == "answer"),
+                        mandatory=(
+                            decision.reason == "answer" and (must_answer or hint)
+                        ),
                     )
                     if not allowed:
                         should_send = False
@@ -606,28 +642,52 @@ async def main() -> None:
 
                 if should_send:
                     if active is not snapshot:
+                        await drop_placeholder()
                         return
-                    try:
-                        await send_bot_message(
-                            snapshot["chat_id"],
-                            decision.message,
-                            decision.reason,
-                        )
-                    except Exception:
-                        log.exception("Не удалось отправить сообщение")
+                    if placeholder is not None:
+                        try:
+                            await client.edit_message(
+                                chat_id,
+                                placeholder.id,
+                                ROBOT_PREFIX + decision.message,
+                            )
+                        except Exception:
+                            log.warning(
+                                "Не удалось изменить заглушку, отправляю новым сообщением",
+                                exc_info=True,
+                            )
+                            await drop_placeholder()
+                            try:
+                                await send_bot_message(
+                                    snapshot["chat_id"],
+                                    decision.message,
+                                    decision.reason,
+                                )
+                            except Exception:
+                                log.exception("Не удалось отправить сообщение")
+                        else:
+                            if replace_recent_placeholder(
+                                recent, PLACEHOLDER_TEXT, truncate(decision.message)
+                            ):
+                                persist()
+                        placeholder = None
+                    else:
+                        try:
+                            await send_bot_message(
+                                snapshot["chat_id"],
+                                decision.message,
+                                decision.reason,
+                            )
+                        except Exception:
+                            log.exception("Не удалось отправить сообщение")
+                elif placeholder is not None:
+                    await drop_placeholder()
 
                 if pending_count < next_wake:
                     return
                 if time.monotonic() < llm_backoff_until:
                     return
         finally:
-            if typing_stop is not None:
-                typing_stop.set()
-            if typing_task is not None:
-                try:
-                    await typing_task
-                except asyncio.CancelledError:
-                    pass
             waking = False
 
     @client.on(events.NewMessage(outgoing=True))
