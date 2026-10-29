@@ -94,14 +94,14 @@ def parse_command(text: str) -> str | None:
 
 
 def parse_service_command(text: str) -> str | None:
-    """Возвращает текст после '!служебно' или None, если это не такая команда."""
+    """Возвращает текст после '!служебно' (или '!служебное') или None."""
     stripped = (text or "").strip()
     low = stripped.lower()
-    prefix = "!служебно"
-    if low == prefix:
-        return ""
-    if low.startswith(prefix) and len(low) > len(prefix) and not low[len(prefix)].isalnum():
-        return stripped[len(prefix):].lstrip(" \t\n:,-—–").strip()
+    for prefix in ("!служебно", "!служебное"):
+        if low == prefix:
+            return ""
+        if low.startswith(prefix) and len(low) > len(prefix) and not low[len(prefix)].isalnum():
+            return stripped[len(prefix):].lstrip(" \t\n:,-—–").strip()
     return None
 
 
@@ -538,6 +538,7 @@ async def main() -> None:
         sent_times.setdefault(chat_id, deque()).append(now)
         if reason == "conflict":
             last_conflict_at[chat_id] = now
+        log.info("Сообщение отправлено в чат %s (reason=%s)", chat_id, reason or "-")
 
     async def run_wake(force: bool = False, addressed: bool = False) -> None:
         nonlocal pending_count, next_wake, facts, norms, waking, llm_backoff_until
@@ -852,4 +853,22 @@ if __name__ == "__main__":
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    failures = 0
+    while True:
+        started = time.monotonic()
+        try:
+            asyncio.run(main())
+        except (KeyboardInterrupt, SystemExit):
+            break
+        except BaseException:
+            log.exception("Критическая ошибка, перезапуск")
+        else:
+            log.warning("Основной цикл завершён, перезапуск")
+        uptime = time.monotonic() - started
+        failures = failures + 1 if uptime < 60 else 0
+        delay = min(300, 10 * (2 ** min(failures, 4)))
+        log.info("Перезапуск через %s c", delay)
+        try:
+            time.sleep(delay)
+        except KeyboardInterrupt:
+            break
