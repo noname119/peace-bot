@@ -226,7 +226,7 @@ async def main() -> None:
         times = sent_times.setdefault(chat_id, deque())
         while times and now - times[0] > RATE_WINDOW:
             times.popleft()
-        if len(times) >= RATE_MAX:
+        if not mandatory and len(times) >= RATE_MAX:
             return False, "лимит 6 сообщений за 10 минут"
         return True, ""
 
@@ -538,24 +538,16 @@ async def main() -> None:
 
                 chat_id = snapshot["chat_id"]
                 if hint and placeholder is None and time.monotonic() >= silence_until:
-                    now = time.time()
-                    rate_times = sent_times.setdefault(chat_id, deque())
-                    while rate_times and now - rate_times[0] > RATE_WINDOW:
-                        rate_times.popleft()
-                    if len(rate_times) < RATE_MAX:
-                        try:
-                            placeholder = await client.send_message(
-                                build_peer(snapshot) or chat_id,
-                                ROBOT_PREFIX + PLACEHOLDER_TEXT,
-                            )
-                        except Exception:
-                            log.warning("Не удалось отправить заглушку", exc_info=True)
-                            placeholder = None
-                    if placeholder is not None:
-                        if placeholder.id not in bot_message_ids:
-                            bot_message_ids.append(placeholder.id)
-                        last_bot_at[chat_id] = time.time()
-                        sent_times.setdefault(chat_id, deque()).append(time.time())
+                    try:
+                        placeholder = await client.send_message(
+                            build_peer(snapshot) or chat_id,
+                            ROBOT_PREFIX + PLACEHOLDER_TEXT,
+                        )
+                    except Exception:
+                        log.warning("Не удалось отправить заглушку", exc_info=True)
+                        placeholder = None
+                    if placeholder is not None and placeholder.id not in bot_message_ids:
+                        bot_message_ids.append(placeholder.id)
                 last_ts = last_bot_at.get(chat_id)
                 last_minutes = (
                     max(0, int((time.time() - last_ts) / 60)) if last_ts else None
@@ -633,7 +625,7 @@ async def main() -> None:
                         decision.reason,
                         time.time(),
                         mandatory=(
-                            decision.reason == "answer" and (must_answer or hint)
+                            decision.reason == "answer" and hint
                         ),
                     )
                     if not allowed:
@@ -670,6 +662,12 @@ async def main() -> None:
                                 recent, PLACEHOLDER_TEXT, truncate(decision.message)
                             ):
                                 persist()
+                            now = time.time()
+                            last_bot_at[chat_id] = now
+                            sent_times.setdefault(chat_id, deque()).append(now)
+                            if decision.reason == "conflict":
+                                last_conflict_at[chat_id] = now
+                            log.info("Сообщение отправлено (правка заглушки)")
                         placeholder = None
                     else:
                         try:
