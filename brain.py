@@ -130,6 +130,7 @@ async def decide(
     addressed: bool = False,
     reply_enabled: bool = True,
     chime_enabled: bool = True,
+    mandatory: bool = False,
 ) -> Decision | None:
     if not cfg.llm_api_key:
         log.warning("LLM не настроен, бот не может принять решение")
@@ -164,10 +165,15 @@ async def decide(
     else:
         chime_rule = "Никогда не вступай в разговор сам: не используй reason='chime'. "
     mode_parts = []
-    if not reply_enabled:
+    if not reply_enabled and not (mandatory and addressed):
         mode_parts.append(
             "ответы отключены: не отвечай на обращения, вопросы и просьбы, "
             "speak=true только чтобы остановить настоящий конфликт"
+        )
+    if mandatory and addressed:
+        mode_parts.append(
+            "к тебе обратились: ответить ОБЯЗАТЕЛЬНО, "
+            "верни speak=true и reason='answer', молчать запрещено"
         )
     if not chime_enabled:
         mode_parts.append("вступления отключены: не используй reason='chime'")
@@ -241,3 +247,64 @@ async def decide(
     if decision is None:
         log.warning("LLM вернул невалидный JSON: %s", str(content)[:300])
     return decision
+
+
+async def answer_forced(
+    cfg: Config,
+    facts: str,
+    norms: str,
+    recent: list[tuple[str, str]],
+) -> str | None:
+    """Обязательный ответ на прямое обращение.
+
+    Возвращает текст ответа, "" если модель отказалась,
+    None при ошибке транспорта.
+    """
+    if not cfg.llm_api_key:
+        return None
+    try:
+        import httpx
+    except ImportError:
+        return None
+
+    prompt = (
+        f"Долговременная память:\n{facts or '(пусто)'}\n\n"
+        f"Нормы общения в чате:\n{norms or '(не заданы)'}\n\n"
+        f"Последние сообщения:\n{_format_recent(recent)}\n\n"
+        "К тебе обратились напрямую. Ты ОБЯЗАН ответить: 1–3 предложения, "
+        "по-русски, нейтрально и по делу. Это может быть ответ на вопрос, "
+        "просьба уточнить детали или короткая реакция на обращение. "
+        "Не читай мораль, не говори за участников. "
+        "Верни только текст ответа, без кавычек и пояснений."
+    )
+    payload = {
+        "model": cfg.llm_model,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 800,
+    }
+    if cfg.llm_thinking:
+        payload["thinking"] = {"type": "enabled"}
+        payload["reasoning_effort"] = cfg.llm_reasoning_effort
+    else:
+        payload["temperature"] = 0.7
+    headers = {"Authorization": f"Bearer {cfg.llm_api_key}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=cfg.llm_timeout) as http:
+            response = await http.post(
+                f"{cfg.llm_base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+        content = data["choices"][0]["message"]["content"]
+    except Exception:
+        log.warning("LLM недоступен для обязательного ответа", exc_info=True)
+        return None
+
+    text = " ".join(str(content).split()).strip().strip('"«»').strip()
+    return text.removeprefix("🤖").strip()

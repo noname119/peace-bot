@@ -29,6 +29,7 @@ BOT_MIN_GAP = 30
 CONFLICT_MIN_GAP = 600
 RATE_WINDOW = 600
 RATE_MAX = 6
+FALLBACK_ANSWER = "Слушаю тебя. Что случилось?"
 RESET_FLAG = Path(__file__).with_name("reset.flag")
 LOG_PATH = Path(__file__).with_name("bot.log")
 
@@ -149,8 +150,8 @@ async def main() -> None:
     def is_active_chat(event) -> bool:
         return active is not None and event.chat_id == active["chat_id"]
 
-    def can_send(chat_id: int, reason: str, now: float) -> tuple[bool, str]:
-        if now - last_bot_at.get(chat_id, 0) < BOT_MIN_GAP:
+    def can_send(chat_id: int, reason: str, now: float, mandatory: bool = False) -> tuple[bool, str]:
+        if not mandatory and now - last_bot_at.get(chat_id, 0) < BOT_MIN_GAP:
             return False, "слишком часто"
         if reason == "conflict" and now - last_conflict_at.get(chat_id, 0) < CONFLICT_MIN_GAP:
             return False, "недавно уже вмешивались в конфликт"
@@ -326,6 +327,7 @@ async def main() -> None:
                 force = False
 
                 hint = addressed if first else False
+                must_answer = hint and cfg.mandatory_reply
                 first = False
                 analyzed = pending_count
 
@@ -345,11 +347,28 @@ async def main() -> None:
                     hint,
                     cfg.reply_enabled,
                     cfg.chime_enabled,
+                    must_answer,
                 )
                 if decision is None:
                     llm_backoff_until = time.monotonic() + LLM_BACKOFF
                     log.warning("Пробуждение отложено на %s секунд", LLM_BACKOFF)
                     return
+
+                if must_answer and (not decision.speak or not decision.message):
+                    forced = await brain.answer_forced(cfg, facts, norms, list(recent))
+                    if forced is None:
+                        llm_backoff_until = time.monotonic() + LLM_BACKOFF
+                        log.warning("Пробуждение отложено на %s секунд", LLM_BACKOFF)
+                        return
+                    decision = brain.Decision(
+                        True,
+                        forced or FALLBACK_ANSWER,
+                        decision.next_wake,
+                        decision.memory,
+                        decision.norms,
+                        "answer",
+                    )
+                    log.info("Обязательный ответ на обращение")
 
                 pending_count = max(0, pending_count - analyzed)
                 next_wake = decision.next_wake
@@ -368,14 +387,24 @@ async def main() -> None:
                 )
 
                 should_send = decision.speak
-                if should_send and decision.reason == "answer" and not cfg.reply_enabled:
+                if (
+                    should_send
+                    and decision.reason == "answer"
+                    and not cfg.reply_enabled
+                    and not must_answer
+                ):
                     should_send = False
                     log.info("Сообщение пропущено: ответы отключены (REPLY_ENABLED=0)")
                 if should_send and decision.reason == "chime" and not cfg.chime_enabled:
                     should_send = False
                     log.info("Сообщение пропущено: вступления отключены (CHIME_ENABLED=0)")
                 if should_send:
-                    allowed, why = can_send(chat_id, decision.reason, time.time())
+                    allowed, why = can_send(
+                        chat_id,
+                        decision.reason,
+                        time.time(),
+                        mandatory=(must_answer and decision.reason == "answer"),
+                    )
                     if not allowed:
                         should_send = False
                         log.info("Сообщение пропущено: %s", why)

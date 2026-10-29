@@ -49,6 +49,7 @@ class Config:
     reply_enabled: bool
     chime_enabled: bool
     chime_min_gap: int
+    mandatory_reply: bool
 
 
 def load_config() -> Config:
@@ -68,4 +69,5 @@ def load_config() -> Config:
         reply_enabled=_env_bool("REPLY_ENABLED", True),
         chime_enabled=_env_bool("CHIME_ENABLED", True),
         chime_min_gap=max(60, _env_int("CHIME_MIN_GAP", 900)),
+        mandatory_reply=_env_bool("MANDATORY_REPLY", True),
     )
