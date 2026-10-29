@@ -24,7 +24,10 @@ RECENT_LIMIT = 100
 BOT_ID_LIMIT = 10
 INITIAL_WAKE = 1
 LLM_BACKOFF = 60
+CHIME_MIN_GAP = 900
 RESET_FLAG = Path(__file__).with_name("reset.flag")
+
+BOT_WORD_STRIP = ".,!?;:()[]{}\"'«»…—–-"
 
 
 def truncate(text: str, limit: int = TEXT_LIMIT) -> str:
@@ -81,6 +84,14 @@ def parse_command(text: str) -> str | None:
     return None
 
 
+def contains_bot_word(text: str) -> bool:
+    for token in (text or "").lower().split():
+        cleaned = token.strip(BOT_WORD_STRIP)
+        if cleaned == "бот" or cleaned.startswith("бот-"):
+            return True
+    return False
+
+
 async def main() -> None:
     if sys.platform == "win32":
         try:
@@ -114,6 +125,7 @@ async def main() -> None:
     next_wake = INITIAL_WAKE
     pending_count = 0
     bot_message_ids: deque[int] = deque(maxlen=BOT_ID_LIMIT)
+    last_bot_at: dict[int, float] = {}
     waking = False
     llm_backoff_until = 0.0
 
@@ -170,6 +182,8 @@ async def main() -> None:
                 role = "Бот"
                 if message.id not in bot_message_ids:
                     bot_message_ids.append(message.id)
+                if message.date:
+                    last_bot_at[active["chat_id"]] = message.date.timestamp()
             elif message.out:
                 role = "Я"
             else:
@@ -257,8 +271,9 @@ async def main() -> None:
         sent = await client.send_message(peer, ROBOT_PREFIX + text)
         if sent and sent.id not in bot_message_ids:
             bot_message_ids.append(sent.id)
+        last_bot_at[chat_id] = time.time()
 
-    async def run_wake(force: bool = False) -> None:
+    async def run_wake(force: bool = False, addressed: bool = False) -> None:
         nonlocal pending_count, next_wake, facts, norms, waking, llm_backoff_until
         if waking or active is None:
             return
@@ -268,6 +283,7 @@ async def main() -> None:
             return
 
         waking = True
+        first = True
         try:
             while True:
                 snapshot = active
@@ -277,8 +293,25 @@ async def main() -> None:
                     return
                 force = False
 
+                hint = addressed if first else False
+                first = False
                 analyzed = pending_count
-                decision = await brain.decide(cfg, facts, norms, list(recent), analyzed)
+
+                chat_id = snapshot["chat_id"]
+                last_ts = last_bot_at.get(chat_id)
+                last_minutes = (
+                    max(0, int((time.time() - last_ts) / 60)) if last_ts else None
+                )
+
+                decision = await brain.decide(
+                    cfg,
+                    facts,
+                    norms,
+                    list(recent),
+                    analyzed,
+                    last_minutes,
+                    hint,
+                )
                 if decision is None:
                     llm_backoff_until = time.monotonic() + LLM_BACKOFF
                     log.warning("Пробуждение отложено на %s секунд", LLM_BACKOFF)
@@ -293,13 +326,24 @@ async def main() -> None:
                 persist()
 
                 log.info(
-                    "Пробуждение: speak=%s next_wake=%s pending=%s",
+                    "Пробуждение: speak=%s reason=%s next_wake=%s pending=%s",
                     decision.speak,
+                    decision.reason or "-",
                     next_wake,
                     pending_count,
                 )
 
-                if decision.speak:
+                should_send = decision.speak
+                if should_send and decision.reason == "chime":
+                    gap = time.time() - last_bot_at.get(chat_id, 0)
+                    if gap < CHIME_MIN_GAP:
+                        should_send = False
+                        log.info(
+                            "Чим пропущен: последнее сообщение бота %.0f с назад",
+                            gap,
+                        )
+
+                if should_send:
                     if active is not snapshot:
                         return
                     try:
@@ -324,6 +368,7 @@ async def main() -> None:
                 append_recent("Бот", text.removeprefix(ROBOT_PREFIX).strip())
                 if event.id not in bot_message_ids:
                     bot_message_ids.append(event.id)
+                last_bot_at[event.chat_id] = time.time()
                 persist()
             return
 
@@ -351,8 +396,11 @@ async def main() -> None:
         persist()
         pending_count += 1
 
-        reply_to_bot = bool(event.reply_to_msg_id and event.reply_to_msg_id in bot_message_ids)
-        await run_wake(force=reply_to_bot)
+        addressed_hint = bool(
+            (event.reply_to_msg_id and event.reply_to_msg_id in bot_message_ids)
+            or contains_bot_word(text)
+        )
+        await run_wake(force=addressed_hint, addressed=addressed_hint)
 
     @client.on(events.NewMessage(incoming=True))
     async def on_incoming(event):
@@ -371,8 +419,11 @@ async def main() -> None:
         persist()
         pending_count += 1
 
-        reply_to_bot = bool(event.reply_to_msg_id and event.reply_to_msg_id in bot_message_ids)
-        await run_wake(force=reply_to_bot)
+        addressed_hint = bool(
+            (event.reply_to_msg_id and event.reply_to_msg_id in bot_message_ids)
+            or contains_bot_word(text)
+        )
+        await run_wake(force=addressed_hint, addressed=addressed_hint)
 
     skip_seed = RESET_FLAG.exists()
     if skip_seed:
