@@ -32,11 +32,25 @@ LLM_BACKOFF = 60
 BOT_MIN_GAP = 30
 RATE_WINDOW = 600
 RATE_MAX = 6
+SEND_TIMEOUT = 30
+SEED_TIMEOUT = 120
+DELETE_TIMEOUT = 20
+DOWNLOAD_TIMEOUT = 60
+FETCH_TIMEOUT = 15
 FALLBACK_ANSWER = "Слушаю тебя. Что случилось?"
 RESET_FLAG = Path(__file__).with_name("reset.flag")
 LOG_PATH = Path(__file__).with_name("bot.log")
 
 BOT_WORD_STRIP = ".,!?;:()[]{}\"'«»…—–-"
+
+
+async def tg_call(coro, timeout: float, what: str):
+    """Вызов Telegram API с таймаутом: вместо вечного зависания — исключение."""
+    try:
+        return await asyncio.wait_for(asyncio.ensure_future(coro), timeout)
+    except asyncio.TimeoutError:
+        log.warning("%s: таймаут %s c", what, timeout)
+        raise
 
 
 def truncate(text: str, limit: int = TEXT_LIMIT) -> str:
@@ -266,7 +280,11 @@ async def main() -> None:
         if not mime:
             return None
         try:
-            data = await client.download_media(message, file=bytes)
+            data = await tg_call(
+                client.download_media(message, file=bytes),
+                DOWNLOAD_TIMEOUT,
+                "Скачивание медиа",
+            )
         except Exception:
             data = None
             log.debug("Не удалось скачать медиа", exc_info=True)
@@ -286,7 +304,11 @@ async def main() -> None:
             return
         peer = build_peer(active) or active["chat_id"]
         try:
-            messages = await client.get_messages(peer, limit=RECENT_LIMIT)
+            messages = await tg_call(
+                client.get_messages(peer, limit=RECENT_LIMIT),
+                SEED_TIMEOUT,
+                "Загрузка истории чата",
+            )
         except Exception:
             log.warning("Не удалось загрузить историю чата", exc_info=True)
             return
@@ -334,13 +356,17 @@ async def main() -> None:
 
     async def notify_owner(text: str) -> None:
         try:
-            await client.send_message("me", ROBOT_PREFIX + text)
+            await tg_call(
+                client.send_message("me", ROBOT_PREFIX + text),
+                SEND_TIMEOUT,
+                "Уведомление владельцу",
+            )
         except Exception:
             log.exception("Не удалось отправить подтверждение в Избранное")
 
     async def delete_command(event) -> None:
         try:
-            await event.delete()
+            await tg_call(event.delete(), DELETE_TIMEOUT, "Удаление команды")
         except Exception:
             log.debug("Не удалось удалить команду", exc_info=True)
 
@@ -530,7 +556,11 @@ async def main() -> None:
         if snapshot is None:
             return
         peer = build_peer(snapshot) or chat_id
-        sent = await client.send_message(peer, ROBOT_PREFIX + text)
+        sent = await tg_call(
+            client.send_message(peer, ROBOT_PREFIX + text),
+            SEND_TIMEOUT,
+            "Отправка сообщения",
+        )
         if sent and sent.id not in bot_message_ids:
             bot_message_ids.append(sent.id)
         now = time.time()
@@ -572,7 +602,11 @@ async def main() -> None:
                 return
             msg, placeholder = placeholder, None
             try:
-                await client.delete_messages(chat_id, msg.id)
+                await tg_call(
+                    client.delete_messages(chat_id, msg.id),
+                    DELETE_TIMEOUT,
+                    "Удаление заглушки",
+                )
             except Exception:
                 log.debug("Не удалось удалить заглушку", exc_info=True)
             if remove_recent_placeholder(recent, PLACEHOLDER_TEXT):
@@ -605,17 +639,25 @@ async def main() -> None:
                 analyzed = pending_count
 
                 chat_id = snapshot["chat_id"]
-                if hint and placeholder is None and time.monotonic() >= silence_until:
-                    try:
-                        placeholder = await client.send_message(
-                            build_peer(snapshot) or chat_id,
-                            ROBOT_PREFIX + PLACEHOLDER_TEXT,
-                        )
-                    except Exception:
-                        log.warning("Не удалось отправить заглушку", exc_info=True)
-                        placeholder = None
-                    if placeholder is not None and placeholder.id not in bot_message_ids:
-                        bot_message_ids.append(placeholder.id)
+                if hint and placeholder is None:
+                    if time.monotonic() < silence_until:
+                        log.info("Заглушка пропущена: режим молчания")
+                    else:
+                        log.info("Отправляю заглушку (думаю…)")
+                        try:
+                            placeholder = await tg_call(
+                                client.send_message(
+                                    build_peer(snapshot) or chat_id,
+                                    ROBOT_PREFIX + PLACEHOLDER_TEXT,
+                                ),
+                                SEND_TIMEOUT,
+                                "Отправка заглушки",
+                            )
+                        except Exception:
+                            log.warning("Не удалось отправить заглушку", exc_info=True)
+                            placeholder = None
+                        if placeholder is not None and placeholder.id not in bot_message_ids:
+                            bot_message_ids.append(placeholder.id)
                 last_ts = last_bot_at.get(chat_id)
                 last_minutes = (
                     max(0, int((time.time() - last_ts) / 60)) if last_ts else None
@@ -708,10 +750,14 @@ async def main() -> None:
                         return
                     if placeholder is not None:
                         try:
-                            await client.edit_message(
-                                chat_id,
-                                placeholder.id,
-                                ROBOT_PREFIX + decision.message,
+                            await tg_call(
+                                client.edit_message(
+                                    chat_id,
+                                    placeholder.id,
+                                    ROBOT_PREFIX + decision.message,
+                                ),
+                                SEND_TIMEOUT,
+                                "Правка заглушки",
                             )
                         except Exception:
                             log.warning(
@@ -842,7 +888,7 @@ async def main() -> None:
         desc = await describe_photo(event.message)
 
         try:
-            sender = await event.get_sender()
+            sender = await tg_call(event.get_sender(), FETCH_TIMEOUT, "Получение отправителя")
         except Exception:
             sender = None
         parts = media.split_message(event.message, sender_label(sender), desc)
