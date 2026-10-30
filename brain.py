@@ -32,6 +32,8 @@ SYSTEM = (
     "Не говори за участников, не приписывай им слова, не выдумывай факты. "
     "В расшифровке чата 'Я' — владелец аккаунта, 'Бот' — ты, остальные подписи — участники с именами и username. "
     "Различай собеседников и не путай их слова. "
+    "Каждое сообщение помечено временем отправки в квадратных скобках: учитывай давность "
+    "событий («только что», «утром», «вчера вечером») и отвечай с оглядкой на время суток. "
     "Записи с подписью 'Система' и пометкой [авто-описание] — это описания картинок, "
     "сгенерированные тобой же через распознавание. Не приписывай их собеседникам: "
     "они этих слов не писали и ничего не подписывали. "
@@ -62,8 +64,36 @@ class Decision:
     reason: str
 
 
-def _format_recent(recent: list[tuple[str, str]]) -> str:
-    lines = [f"{role}: {text}" for role, text in recent]
+def _format_ts(ts, now) -> str:
+    """Короткая метка времени: сегодня — только часы, иначе дата."""
+    try:
+        moment = datetime.fromtimestamp(float(ts), tz=now.tzinfo)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+    time_part = f"{moment.hour:02d}:{moment.minute:02d}"
+    delta_days = (now.date() - moment.date()).days
+    if delta_days <= 0:
+        return time_part
+    if delta_days == 1:
+        return f"вчера {time_part}"
+    if moment.year == now.year:
+        return f"{moment.day:02d}.{moment.month:02d} {time_part}"
+    return f"{moment.day:02d}.{moment.month:02d}.{moment.year} {time_part}"
+
+
+def _format_recent(recent: list, now=None) -> str:
+    if now is None:
+        now = datetime.now().astimezone()
+    lines = []
+    for entry in recent:
+        if len(entry) >= 3 and entry[2] is not None:
+            role, text, ts = entry[0], entry[1], entry[2]
+            stamp = _format_ts(ts, now)
+            prefix = f"[{stamp}] " if stamp else ""
+        else:
+            role, text = entry[0], entry[1]
+            prefix = ""
+        lines.append(f"{role}: {prefix}{text}")
     return "\n".join(lines) or "(пусто)"
 
 

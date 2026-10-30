@@ -163,16 +163,21 @@ def contains_bot_word(text: str) -> bool:
 
 def replace_recent_placeholder(recent: list, old_text: str, new_text: str) -> bool:
     for i in range(len(recent) - 1, -1, -1):
-        role, text = recent[i]
+        entry = recent[i]
+        role = entry[0]
+        text = entry[1]
+        ts = entry[2] if len(entry) > 2 else None
         if role == "Бот" and text == old_text:
-            recent[i] = ("Бот", new_text)
+            recent[i] = ("Бот", new_text, ts)
             return True
     return False
 
 
 def remove_recent_placeholder(recent: list, old_text: str) -> bool:
     for i in range(len(recent) - 1, -1, -1):
-        role, text = recent[i]
+        entry = recent[i]
+        role = entry[0]
+        text = entry[1] if len(entry) > 1 else ""
         if role == "Бот" and text == old_text:
             del recent[i]
             return True
@@ -253,7 +258,7 @@ async def main() -> None:
         saved = memory.get_chat(chat_id)
         facts = saved["facts"]
         norms = saved["norms"]
-        recent = [tuple(item) for item in saved["recent"]]
+        recent = [tuple(item) if len(item) == 3 else (item[0], item[1], None) for item in saved["recent"]]
         next_wake = saved["next_wake_in"]
         pending_count = 0
         bot_message_ids.clear()
@@ -269,8 +274,10 @@ async def main() -> None:
             norms,
         )
 
-    def append_recent(role: str, text: str) -> None:
-        recent.append((role, truncate(text)))
+    def append_recent(role: str, text: str, ts: float | None = None) -> None:
+        if ts is None:
+            ts = time.time()
+        recent.append((role, truncate(text), int(ts)))
         if len(recent) > RECENT_LIMIT:
             del recent[:-RECENT_LIMIT]
 
@@ -313,7 +320,7 @@ async def main() -> None:
             log.warning("Не удалось загрузить историю чата", exc_info=True)
             return
 
-        items: list[tuple[str, str]] = []
+        items: list[tuple[str, str, int | None]] = []
         labels: dict[int, str] = {}
         vision_targets: list[tuple[int, object, str]] = []
         for message in reversed(messages):
@@ -335,11 +342,15 @@ async def main() -> None:
                         sender = None
                     labels[sender_id] = sender_label(sender)
                 role = labels[sender_id]
+            try:
+                ts = int(message.date.timestamp()) if message.date else None
+            except (TypeError, ValueError, OSError, OverflowError):
+                ts = None
             parts = media.split_message(message, role)
             if not parts:
                 continue
             for entry_role, entry_text in parts:
-                items.append((entry_role, truncate(entry_text)))
+                items.append((entry_role, truncate(entry_text), ts))
             mime = media.vision_mime(message)
             if mime:
                 vision_targets.append((len(items) - 1, message, mime))
@@ -347,7 +358,11 @@ async def main() -> None:
         for index, message, mime in reversed(vision_targets[-2:]):
             desc = await describe_photo(message)
             if desc:
-                items.insert(index + 1, ("Система", truncate(f"{media.SYSTEM_DESC_PREFIX}: {desc}")))
+                try:
+                    vts = int(message.date.timestamp()) if message.date else None
+                except (TypeError, ValueError, OSError, OverflowError):
+                    vts = None
+                items.insert(index + 1, ("Система", truncate(f"{media.SYSTEM_DESC_PREFIX}: {desc}"), vts))
 
         if items:
             recent = items[-RECENT_LIMIT:]
@@ -537,7 +552,7 @@ async def main() -> None:
                 body = norms.strip() or "(нормы не заданы)"
                 header = "Нормы чата:"
             elif order.target == "recent":
-                convo = [f"{role}: {text}" for role, text in recent[-15:]]
+                convo = [f"{entry[0]}: {entry[1]}" for entry in recent[-15:]]
                 body = "\n".join(convo) or "(контекст пуст)"
                 header = "Последние сообщения:"
             else:

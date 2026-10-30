@@ -34,15 +34,21 @@ def get_chat(chat_id: int) -> dict:
     recent = data.get("recent")
     if not isinstance(recent, list):
         recent = []
-    clean_recent: list[list[str]] = []
+    clean_recent: list[list] = []
     for item in recent[-RECENT_LIMIT:]:
         if (
             isinstance(item, list)
-            and len(item) == 2
+            and len(item) in (2, 3)
             and isinstance(item[0], str)
             and isinstance(item[1], str)
         ):
-            clean_recent.append([item[0], item[1]])
+            ts = None
+            if len(item) >= 3 and item[2] is not None:
+                try:
+                    ts = int(item[2])
+                except (TypeError, ValueError):
+                    ts = None
+            clean_recent.append([item[0], item[1], ts])
 
     norms = data.get("norms")
     if not isinstance(norms, str):
