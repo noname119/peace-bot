@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 from config import Config
 
@@ -64,6 +65,44 @@ class Decision:
 def _format_recent(recent: list[tuple[str, str]]) -> str:
     lines = [f"{role}: {text}" for role, text in recent]
     return "\n".join(lines) or "(пусто)"
+
+
+_WEEKDAYS_RU = [
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+]
+_MONTHS_RU = [
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+]
+
+
+def format_now(moment: datetime | None = None) -> str:
+    """Текущие дата и время строкой, например 'среда, 30 октября 2026, 13:45'."""
+    now = moment or datetime.now().astimezone()
+    if now.tzinfo is None:
+        now = now.astimezone()
+    tz = now.tzname() or "местное время"
+    return (
+        f"{_WEEKDAYS_RU[now.weekday()]}, {now.day} "
+        f"{_MONTHS_RU[now.month - 1]} {now.year}, "
+        f"{now.hour:02d}:{now.minute:02d} ({tz})"
+    )
 
 
 def parse_decision(content: str) -> Decision | None:
@@ -261,6 +300,8 @@ async def decide(
     reply_enabled: bool = True,
     chime_enabled: bool = True,
     mandatory: bool = False,
+    now_text: str = "",
+    proactive: bool = False,
 ) -> Decision | None:
     if not cfg.llm_api_key:
         log.warning("LLM не настроен, бот не может принять решение")
@@ -312,14 +353,26 @@ async def decide(
         if mode_parts
         else ""
     )
+    if proactive:
+        proactive_note = (
+            "Это пробуждение по таймеру, а не по новым сообщениям: чаще всего "
+            "отвечай молчанием (speak=false). Говори только если есть реальный повод: "
+            "наступило утро, а ты ещё не здоровался сегодня; в памяти есть напоминание "
+            "с подходящей датой; чат давно молчит и уместно поинтересоваться, как дела. "
+            "Не здоровайся повторно и не повторяй сказанное ранее. "
+        )
+    else:
+        proactive_note = ""
     prompt = (
         f"Долговременная память:\n{facts or '(пусто)'}\n\n"
         f"Нормы общения в чате:\n{norms or '(не заданы)'}\n\n"
+        f"Сейчас: {now_text or 'неизвестно'}.\n\n"
         f"Последние сообщения чата:\n{_format_recent(recent)}\n\n"
         f"Новых сообщений с прошлого пробуждения: {pending_count}.\n"
         f"Ты последний раз писал: {last_bot_text}.\n"
-        f"К тебе обращаются в новых сообщениях: {'да' if addressed else 'нет'}.\n\n"
-        "Сначала оцени, что происходит: дружеская шутка, обычный разговор или настоящий конфликт. "
+        f"К тебе обращаются в новых сообщениях: {'да' if addressed else 'нет'}.\n"
+        + proactive_note
+        + "\nСначала оцени, что происходит: дружеская шутка, обычный разговор или настоящий конфликт. "
         "Если это взаимные подколы и никто не задет, обычно лучше speak=false или короткая шутка, "
         "без морали и без слов «это неприемлемо». "
         "Если конфликт настоящий — вмешивайся ОБЯЗАТЕЛЬНО: speak=true, reason='conflict'. "

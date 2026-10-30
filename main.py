@@ -540,21 +540,27 @@ async def main() -> None:
             last_conflict_at[chat_id] = now
         log.info("Сообщение отправлено в чат %s (reason=%s)", chat_id, reason or "-")
 
-    async def run_wake(force: bool = False, addressed: bool = False) -> None:
+    async def run_wake(force: bool = False, addressed: bool = False, proactive: bool = False) -> None:
         nonlocal pending_count, next_wake, facts, norms, waking, llm_backoff_until
         nonlocal wake_queued, wake_queued_addressed
         if active is None:
             return
         if waking:
-            if force:
+            if force and not proactive:
                 wake_queued = True
                 wake_queued_addressed = wake_queued_addressed or addressed
                 log.info("Пробуждение поставлено в очередь (бот занят)")
+            elif proactive:
+                log.info("Плановое пробуждение пропущено: бот занят")
             return
-        if not force and pending_count < next_wake:
+        if pending_count <= 0 and not force and not proactive:
+            return
+        if not force and not proactive and pending_count < next_wake:
             return
         if time.monotonic() < llm_backoff_until:
             return
+        if proactive:
+            log.info("Плановое пробуждение по таймеру")
 
         waking = True
         first = True
@@ -582,11 +588,16 @@ async def main() -> None:
                     first = True
                     log.info("Пробуждение из очереди")
                 snapshot = active
-                if snapshot is None or pending_count <= 0:
+                if snapshot is None:
                     return
-                if not force and pending_count < next_wake:
+                run_now = force or proactive
+                if pending_count <= 0 and not run_now:
+                    return
+                if not run_now and pending_count < next_wake:
                     return
                 force = False
+                cur_proactive = proactive
+                proactive = False
 
                 hint = addressed if first else False
                 must_answer = hint and cfg.mandatory_reply
@@ -621,6 +632,8 @@ async def main() -> None:
                     cfg.reply_enabled,
                     cfg.chime_enabled,
                     must_answer,
+                    brain.format_now(),
+                    cur_proactive,
                 )
                 if decision is None:
                     llm_backoff_until = time.monotonic() + LLM_BACKOFF
@@ -745,6 +758,25 @@ async def main() -> None:
         finally:
             waking = False
 
+    async def proactive_loop() -> None:
+        minutes = max(0, cfg.proactive_wake_minutes)
+        if minutes <= 0:
+            return
+        interval = max(300, minutes * 60)
+        log.info("Плановые пробуждения: каждые %s мин", minutes)
+        while True:
+            await asyncio.sleep(interval)
+            if active is None:
+                continue
+            if time.monotonic() < llm_backoff_until:
+                continue
+            if time.monotonic() < silence_until:
+                continue
+            try:
+                await run_wake(force=True, addressed=False, proactive=True)
+            except Exception:
+                log.exception("Ошибка планового пробуждения")
+
     @client.on(events.NewMessage(outgoing=True))
     async def on_outgoing(event):
         nonlocal pending_count
@@ -845,6 +877,7 @@ async def main() -> None:
         log.info("Бот не активирован. Отправьте !activate в нужном чате")
 
     log.info("Слушаю сообщения")
+    asyncio.create_task(proactive_loop())
     await client.run_until_disconnected()
 
 

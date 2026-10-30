@@ -51,6 +51,7 @@ class Config:
     chime_min_gap: int
     mandatory_reply: bool
     conflict_min_gap: int
+    proactive_wake_minutes: int
     vision_enabled: bool
     vision_base_url: str
     vision_api_key: str
@@ -83,6 +84,7 @@ def load_config() -> Config:
         chime_min_gap=max(60, _env_int("CHIME_MIN_GAP", 900)),
         mandatory_reply=_env_bool("MANDATORY_REPLY", True),
         conflict_min_gap=max(30, _env_int("CONFLICT_MIN_GAP", 90)),
+        proactive_wake_minutes=_env_int("PROACTIVE_WAKE_MINUTES", 60),
         vision_enabled=_env_bool("VISION_ENABLED", True),
         vision_base_url=_fallback_env(
             "VISION_BASE_URL", "OPENAI_BASE_URL", "https://api.deepseek.com/v1"
