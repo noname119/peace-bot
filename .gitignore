@@ -8,3 +8,6 @@ bot.log*
 *.session-journal
 __pycache__/
 *.pyc
+models/
+faces.db
+faces.db-*

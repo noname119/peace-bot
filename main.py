@@ -14,6 +14,7 @@ from telethon import TelegramClient, events
 from telethon.tl.types import InputPeerChannel, InputPeerChat, InputPeerUser
 
 import brain
+import faces
 import media
 import memory
 import state
@@ -299,9 +300,22 @@ async def main() -> None:
             log.info("Фото: не удалось скачать")
             return None
         desc = await vision.describe_image(cfg, data, mime)
+        people_line = None
+        try:
+            people = await faces.analyze_photo_async(data, cfg.face_match_threshold)
+            line = faces.format_people_line(people) if people else None
+            if line:
+                log.info("На фото: %s", line)
+                people_line = line
+        except Exception:
+            log.debug("Распознавание лиц не удалось", exc_info=True)
+        if desc and people_line:
+            return f"{desc}\n{people_line}"
         if desc:
             log.info("Фото описано: %s", desc[:150])
             return desc
+        if people_line:
+            return people_line
         log.info("Фото: vision не вернул описание")
         return None
 
@@ -443,6 +457,54 @@ async def main() -> None:
             f"Память и контекст в чате «{title}» очищены. Начинаю с чистого листа."
         )
 
+    async def _resolve_enroll_photo(event):
+        """Фото для запоминания лица: ответ на сообщение, иначе последнее фото в чате.
+
+        Возвращает (bytes, описание источника) или (None, причина).
+        """
+        # 1. Ответ на сообщение
+        try:
+            reply_id = getattr(event, "reply_to_msg_id", None)
+        except Exception:
+            reply_id = None
+        if reply_id:
+            try:
+                msg = await tg_call(event.get_reply_message(), FETCH_TIMEOUT, "Получение ответа")
+            except Exception:
+                msg = None
+                log.debug("Не удалось получить сообщение-ответ", exc_info=True)
+            if msg is not None:
+                if media.vision_mime(msg):
+                    try:
+                        data = await tg_call(client.download_media(msg, file=bytes), DOWNLOAD_TIMEOUT, "Скачивание фото для enroll")
+                    except Exception:
+                        data = None
+                        log.debug("Не удалось скачать фото из ответа", exc_info=True)
+                    if data:
+                        return data, "фото из ответа на сообщение"
+                    return None, "не удалось скачать фото из ответа"
+                return None, "в ответе нет фото — ответь на сообщение с фото"
+        # 2. Последнее фото в истории чата
+        try:
+            peer = build_peer(active) or active["chat_id"]
+            history = await tg_call(client.get_messages(peer, limit=30), FETCH_TIMEOUT, "Поиск фото в чате")
+        except Exception:
+            log.warning("Не удалось получить историю чата для enroll", exc_info=True)
+            history = None
+        for m in history or []:
+            if m is None or getattr(m, "id", None) == getattr(event, "id", None):
+                continue
+            if not media.vision_mime(m):
+                continue
+            try:
+                data = await tg_call(client.download_media(m, file=bytes), DOWNLOAD_TIMEOUT, "Скачивание фото для enroll")
+            except Exception:
+                log.debug("Не удалось скачать фото из истории", exc_info=True)
+                continue
+            if data:
+                return data, "последнего фото в чате"
+        return None, "не нашёл фото — ответь на фото командой или пришли свежее"
+
     async def execute_service_order(event, order_text: str) -> None:
         nonlocal facts, norms, next_wake, silence_until
         if active is None:
@@ -534,13 +596,17 @@ async def main() -> None:
             else:
                 silence_text = "выкл"
             fact_lines = [line for line in facts.splitlines() if line.strip()]
+            try:
+                known_faces = len(faces.list_persons())
+            except Exception:
+                known_faces = 0
             lines = [
                 f"Активный чат: «{title}» ({chat_id})",
                 f"Пробуждение через: {next_wake} сообщений (накоплено: {pending_count})",
                 f"Последнее сообщение бота: {last_text}",
                 f"Молчание: {silence_text}",
                 f"Память: фактов: {len(fact_lines)}, нормы: {'есть' if norms.strip() else 'нет'}, "
-                f"сообщений в контексте: {len(recent)}",
+                f"сообщений в контексте: {len(recent)}, знакомых лиц: {known_faces}",
                 f"LLM: {cfg.llm_model} (thinking {'вкл' if cfg.llm_thinking else 'выкл'})",
             ]
             await notify_owner("\n".join(lines))
@@ -563,6 +629,55 @@ async def main() -> None:
                 body = "\n\n".join(parts)
                 header = "Память бота:"
             await notify_owner(f"{header}\n{body}")
+        elif order.action == "enroll_face":
+            name = (order.text or "").strip().strip("\"'«»„“”‘’")
+            if not name:
+                await notify_owner("Кого запомнить? Пример: !служебно запомни это лицо как Лиска (ответом на фото)")
+                return
+            found = await _resolve_enroll_photo(event)
+            if not found or not found[0]:
+                await notify_owner(f"Не нашёл фото для запоминания: {found[1] if found else 'неизвестная ошибка'}.")
+                return
+            try:
+                found_faces = await faces.analyze_photo_async(found[0], cfg.face_match_threshold)
+            except Exception:
+                log.warning("Анализ лица для enroll не удался", exc_info=True)
+                await notify_owner("Не удалось проанализировать фото.")
+                return
+            with_emb = [f for f in found_faces if f.get("embedding") is not None]
+            if not with_emb:
+                await notify_owner("На этом фото лиц не нашёл. Нужно чёткое фото лица анфас.")
+                return
+            if len(with_emb) > 1:
+                await notify_owner(f"На фото {len(with_emb)} лиц. Ответь командой на фото, где только {name}.")
+                return
+            try:
+                faces.enroll(name, with_emb[0]["embedding"], source="enroll")
+            except Exception as e:
+                log.warning("Не удалось сохранить лицо: %s", e)
+                await notify_owner("Не удалось запомнить лицо.")
+                return
+            await notify_owner(f"Запомнил: {name}. Теперь буду узнавать это лицо на фото.")
+        elif order.action == "forget_face":
+            name = (order.text or "").strip().strip("\"'«»„“”‘’")
+            if not name:
+                await notify_owner("Кого забыть? Пример: !служебно забудь лицо Лиска")
+                return
+            if faces.forget(name):
+                await notify_owner(f"Забыл: {name}.")
+            else:
+                await notify_owner(f"Не знаю никого по имени «{name}».")
+        elif order.action == "list_faces":
+            try:
+                people = faces.list_persons()
+            except Exception:
+                log.warning("Не удалось прочитать базу лиц", exc_info=True)
+                people = []
+            if not people:
+                body = "Пока никого не знаю. Покажи мне фото командой «!служебно запомни это как Имя» в ответ на фото."
+            else:
+                body = "\n".join(f"• {n} — фото: {c}" for n, c in people)
+            await notify_owner(f"Знакомые лица:\n{body}")
         else:
             await notify_owner("Не понял приказ.")
 
@@ -937,8 +1052,15 @@ async def main() -> None:
     else:
         log.info("Бот не активирован. Отправьте !activate в нужном чате")
 
+    async def _warmup_faces() -> None:
+        try:
+            await faces.warmup()
+        except Exception:
+            log.debug("Прогрев моделей лиц пропущен", exc_info=True)
+
     log.info("Слушаю сообщения")
     asyncio.create_task(proactive_loop())
+    asyncio.create_task(_warmup_faces())
     await client.run_until_disconnected()
 
 

@@ -56,6 +56,7 @@ class Config:
     vision_base_url: str
     vision_api_key: str
     vision_model: str
+    face_match_threshold: float
 
 
 def _fallback_env(primary: str, fallback: str, default: str = "") -> str:
@@ -91,4 +92,5 @@ def load_config() -> Config:
         ).rstrip("/"),
         vision_api_key=_fallback_env("VISION_API_KEY", "OPENAI_API_KEY"),
         vision_model=_fallback_env("VISION_MODEL", "LLM_MODEL", "deepseek-flash"),
+        face_match_threshold=_env_float("FACE_MATCH_THRESHOLD", 0.45),
     )
